@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>APEX · Prueba OBD real</title>
+<link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@600;800&family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{color-scheme:dark;
+    --bg:#09090b;--surface:#131418;--surface-2:#1a1c21;--line:#2a2d34;--line-soft:#1f2228;
+    --txt:#f3f5f8;--dim:#8b919b;--faint:#575d67;--orange:#ff6a1a;--cyan:#35d0d8;--green:#47d67f;--red:#f2585e;
+    --fd:'Oxanium',sans-serif;--fm:'JetBrains Mono',monospace;--fb:'Inter',system-ui,sans-serif;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:radial-gradient(700px 360px at 85% -5%,rgba(255,106,26,.13),transparent 60%),var(--bg);
+    color:var(--txt);font-family:var(--fb);-webkit-font-smoothing:antialiased;max-width:460px;margin:0 auto;padding:22px 16px 40px;}
+  .brand{font-family:var(--fd);font-weight:800;font-size:22px;letter-spacing:.16em;}
+  .brand span{color:var(--orange);}
+  .tag{font-family:var(--fm);font-size:10px;color:var(--faint);letter-spacing:.14em;margin:2px 0 18px;}
+  .status{display:flex;align-items:center;gap:8px;font-family:var(--fm);font-size:12px;color:var(--dim);margin-bottom:14px;}
+  .status .d{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:0 0 auto;}
+  .status.on .d{background:var(--green);box-shadow:0 0 8px var(--green);}
+  .status.busy .d{background:var(--orange);box-shadow:0 0 8px var(--orange);}
+  .status.err .d{background:var(--red);box-shadow:0 0 8px var(--red);}
+  .btn{width:100%;padding:16px;border:none;border-radius:14px;cursor:pointer;font-family:var(--fd);font-weight:800;font-size:15px;letter-spacing:.06em;
+    background:linear-gradient(180deg,var(--orange),#d2520c);color:#1a0d04;margin-bottom:16px;}
+  .btn:disabled{opacity:.4;cursor:default;}
+  .btn.dis{background:var(--surface);color:var(--red);border:1px solid #4a2020;}
+  .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-bottom:16px;}
+  .cell{background:var(--surface);border:1px solid var(--line-soft);border-radius:14px;padding:14px 8px;text-align:center;}
+  .cell .v{font-family:var(--fd);font-weight:800;font-size:30px;font-variant-numeric:tabular-nums;color:var(--orange);line-height:1;}
+  .cell .v.cy{color:var(--cyan);}
+  .cell .u{font-family:var(--fm);font-size:9px;color:var(--faint);margin-top:6px;letter-spacing:.04em;}
+  .loglabel{font-family:var(--fm);font-size:10px;color:var(--faint);letter-spacing:.08em;margin-bottom:8px;}
+  #log{background:#0c0d10;border:1px solid var(--line-soft);border-radius:12px;padding:12px;font-family:var(--fm);font-size:11px;line-height:1.6;color:var(--dim);height:260px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;}
+  #log .tx{color:var(--cyan);}#log .rx{color:var(--dim);}#log .ok{color:var(--green);}#log .er{color:var(--red);}#log .in{color:var(--txt);}
+  .note{font-family:var(--fm);font-size:10px;color:var(--faint);line-height:1.6;margin-top:14px;}
+</style>
+</head>
+<body>
+  <div class="brand">AP<span>E</span>X</div>
+  <div class="tag">PRUEBA DE LECTURA OBD REAL · ELM327 BLE</div>
+
+  <div class="status" id="status"><span class="d"></span><span id="statusTx">Desconectado</span></div>
+
+  <button class="btn" id="connectBtn">CONECTAR ELM327</button>
+
+  <div class="grid">
+    <div class="cell"><div class="v" id="rpm">—</div><div class="u">RPM</div></div>
+    <div class="cell"><div class="v cy" id="spd">—</div><div class="u">KM/H</div></div>
+    <div class="cell"><div class="v" id="ect">—</div><div class="u">°C REFRIG.</div></div>
+  </div>
+
+  <div class="loglabel">// REGISTRO DE CONEXIÓN</div>
+  <div id="log"></div>
+
+  <div class="note">Requisitos: ELM327 <b>BLE</b> (no Bluetooth clásico), <b>Chrome en Android</b>, y abrir esta página por <b>HTTPS</b> (GitHub Pages ya lo da). No funciona en iPhone.</div>
+
+<script>
+(function(){
+  "use strict";
+  const $=id=>document.getElementById(id);
+
+  // ====== estado ======
+  let device=null, writeChar=null, notifyChar=null;
+  let buffer='', pending=null, polling=false, useWriteWithoutResponse=false;
+  const decoder=new TextDecoder(), encoder=new TextEncoder();
+
+  // ====== UUIDs comunes de adaptadores ELM327 BLE ======
+  // Distintos clones usan distintos servicios; los listamos todos
+  // para que requestDevice pueda acceder a cualquiera.
+  const KNOWN_SERVICES=[0xFFF0,0xFFE0,0xFFE5,0xFFB0,0xFFF6,0xFD00,
+    '0000fff0-0000-1000-8000-00805f9b34fb',
+    '6e400001-b5a3-f393-e0a9-e50e24dcca9e']; // Nordic UART (raro en ELM)
+
+  // ====== utilidades de log ======
+  function log(msg,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent=msg;$('log').appendChild(d);$('log').scrollTop=$('log').scrollHeight;}
+  function setStatus(txt,cls){$('statusTx').textContent=txt;$('status').className='status'+(cls?' '+cls:'');}
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+  // ====== recepción de datos ======
+  function onData(e){
+    const chunk=decoder.decode(e.target.value);
+    buffer+=chunk;
+    // El ELM327 termina cada respuesta con el prompt '>'
+    if(buffer.includes('>')){
+      const full=buffer.replace('>','').trim();
+      buffer='';
+      if(pending){const p=pending;pending=null;clearTimeout(p.timer);p.resolve(full);}
+    }
+  }
+
+  // ====== enviar un comando y esperar la respuesta ======
+  function send(cmd){
+    return new Promise(async (resolve,reject)=>{
+      buffer='';
+      pending={resolve,timer:setTimeout(()=>{pending=null;reject(new Error('timeout'));},2500)};
+      try{
+        const data=encoder.encode(cmd+'\r');
+        if(useWriteWithoutResponse) await writeChar.writeValueWithoutResponse(data);
+        else await writeChar.writeValue(data);
+      }catch(err){pending=null;reject(err);}
+    });
+  }
+
+  // ====== conexión ======
+  async function connect(){
+    if(!navigator.bluetooth){log('Este navegador no soporta Web Bluetooth. Usa Chrome en Android.','er');return;}
+    try{
+      setStatus('Buscando adaptador…','busy');
+      log('Abriendo selector de dispositivos…','in');
+      device=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:KNOWN_SERVICES});
+      log('Seleccionado: '+(device.name||'(sin nombre)'),'ok');
+      device.addEventListener('gattserverdisconnected',onDisconnect);
+
+      setStatus('Conectando…','busy');
+      const server=await device.gatt.connect();
+      log('GATT conectado. Buscando servicios…','in');
+
+      // Buscar el canal de escritura y el de notificación entre todos los servicios
+      const services=await server.getPrimaryServices();
+      for(const s of services){
+        let chars;
+        try{chars=await s.getCharacteristics();}catch(e){continue;}
+        for(const c of chars){
+          const p=c.properties;
+          if((p.notify||p.indicate)&&!notifyChar) notifyChar=c;
+          if((p.write||p.writeWithoutResponse)&&!writeChar){writeChar=c;useWriteWithoutResponse=!p.write&&p.writeWithoutResponse;}
+        }
+      }
+      // Algunos adaptadores usan una sola característica para leer y escribir
+      if(writeChar&&!notifyChar&&(writeChar.properties.notify||writeChar.properties.indicate)) notifyChar=writeChar;
+
+      if(!writeChar||!notifyChar){log('No encontré los canales de datos del adaptador. ¿Es un ELM327 BLE?','er');setStatus('Error','err');return;}
+      log('Canales listos (escritura + notificación).','ok');
+
+      await notifyChar.startNotifications();
+      notifyChar.addEventListener('characteristicvaluechanged',onData);
+
+      await initAdapter();
+      setStatus('Conectado · leyendo','on');
+      $('connectBtn').textContent='DESCONECTAR';$('connectBtn').className='btn dis';
+      polling=true; pollLoop();
+    }catch(err){
+      log('Error: '+err.message,'er');
+      setStatus('Error de conexión','err');
+    }
+  }
+
+  // ====== inicialización del ELM327 ======
+  async function initAdapter(){
+    setStatus('Inicializando adaptador…','busy');
+    const seq=[
+      ['ATZ',1200],   // reinicio (necesita más tiempo)
+      ['ATE0',200],   // sin eco
+      ['ATL0',200],   // sin saltos de línea
+      ['ATS0',200],   // sin espacios
+      ['ATH0',200],   // sin encabezados (respuesta limpia)
+      ['ATSP0',200]   // autodetección de protocolo
+    ];
+    for(const [cmd,wait] of seq){
+      try{log('> '+cmd,'tx');const r=await send(cmd);log('  '+r,'rx');}
+      catch(e){log('  (sin respuesta a '+cmd+')','er');}
+      await sleep(wait);
+    }
+    log('Adaptador inicializado.','ok');
+  }
+
+  // ====== decodificación de un PID ======
+  // Busca "41"+pid en la respuesta y extrae los bytes de datos.
+  function dataBytes(resp,pidHex){
+    const clean=resp.replace(/[\r\n> ]/g,'').toUpperCase();
+    const marker='41'+pidHex.slice(2); // '010C' -> '410C'
+    const i=clean.indexOf(marker);
+    if(i<0) return null;
+    const payload=clean.slice(i+4);
+    const bytes=[];
+    for(let k=0;k+1<payload.length;k+=2){
+      const b=parseInt(payload.substr(k,2),16);
+      if(isNaN(b)) break;
+      bytes.push(b);
+    }
+    return bytes.length?bytes:null;
+  }
+
+  async function readPid(pidHex){
+    try{const r=await send(pidHex);return dataBytes(r,pidHex);}catch(e){return null;}
+  }
+
+  // ====== bucle de lectura ======
+  async function pollLoop(){
+    while(polling){
+      // RPM — PID 010C — (A*256+B)/4
+      const rpm=await readPid('010C');
+      if(rpm&&rpm.length>=2) $('rpm').textContent=Math.round((rpm[0]*256+rpm[1])/4);
+
+      // Velocidad — PID 010D — A
+      const spd=await readPid('010D');
+      if(spd&&spd.length>=1) $('spd').textContent=spd[0];
+
+      // Temp. refrigerante — PID 0105 — A-40
+      const ect=await readPid('0105');
+      if(ect&&ect.length>=1) $('ect').textContent=(ect[0]-40);
+
+      await sleep(100);
+    }
+  }
+
+  function onDisconnect(){
+    polling=false;writeChar=null;notifyChar=null;
+    setStatus('Desconectado','err');
+    log('El adaptador se desconectó.','er');
+    $('connectBtn').textContent='CONECTAR ELM327';$('connectBtn').className='btn';
+  }
+
+  function disconnect(){
+    polling=false;
+    if(device&&device.gatt.connected) device.gatt.disconnect();
+    else onDisconnect();
+  }
+
+  $('connectBtn').addEventListener('click',()=>{
+    if(polling||(device&&device.gatt&&device.gatt.connected)) disconnect();
+    else connect();
+  });
+})();
+</script>
+</body>
+</html>
